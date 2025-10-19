@@ -366,6 +366,184 @@ def make_train(config):
                     losses = (total_loss, 0)
                     return train_state, losses
 
+                def _update_minibatch(train_state, batch_info):
+                    (
+                        traj_batch,
+                        advantages_e,
+                        targets_e,
+                        advantages_i,
+                        targets_i,
+                    ) = batch_info
+
+                    # compute actor loss
+                    def _actor_loss_fn(
+                        params, traj_batch, gae
+                    ):
+                        # rerun network
+                        pi, _, _ = network.apply(params, traj_batch.obs)
+                        log_prob = pi.log_prob(traj_batch.action)
+
+                        # compute ppo actor loss
+                        ratio = jnp.exp(log_prob - traj_batch.log_prob)
+                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                        loss_actor1 = ratio * gae
+                        loss_actor2 = (
+                            jnp.clip(
+                                ratio,
+                                1.0 - config["CLIP_EPS"],
+                                1.0 + config["CLIP_EPS"],
+                            )
+                            * gae
+                        )
+                        actor_loss = -jnp.minimum(loss_actor1, loss_actor2)
+                        actor_loss = actor_loss.mean()
+
+                        # entropy bonus
+                        entropy = pi.entropy().mean()
+
+                        return actor_loss - config["ENT_COEF"] * entropy
+                    
+                    # compute value loss 
+                    def _value_loss_fn(
+                        params,
+                        traj_batch,
+                        advantages_e,
+                        targets_e,
+                        advantages_i,
+                        targets_i,
+                    ):
+                        # rerun network
+                        pi, value_e, value_i = network.apply(params, traj_batch.obs)
+
+                        # extrinsic value loss
+                        value_pred_clipped_e = traj_batch.value_e + (
+                            value_e - traj_batch.value_e
+                        ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
+                        value_losses_e = jnp.square(value_e - targets_e)
+                        value_losses_clipped_e = jnp.square(
+                            value_pred_clipped_e - targets_e
+                        )
+                        value_loss_e = (
+                            0.5
+                            * jnp.maximum(value_losses_e, value_losses_clipped_e).mean()
+                        )
+
+                        # intrinsic value loss
+                        value_pred_clipped_i = traj_batch.value_i + (
+                            value_i - traj_batch.value_i
+                        ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
+                        value_losses_i = jnp.square(value_i - targets_i)
+                        value_losses_clipped_i = jnp.square(
+                            value_pred_clipped_i - targets_i
+                        )
+                        value_loss_i = (
+                            0.5
+                            * jnp.maximum(value_losses_i, value_losses_clipped_i).mean()
+                        )
+
+                        # apply rnd
+                        value_loss = value_loss_e
+                        if config["USE_RND"]:
+                            value_loss += value_loss_i
+                        
+                        return value_loss
+                    
+                    # define gradient functions
+                    value_grad_fn = jax.value_and_grad(_value_loss_fn)
+                    actor_grad_fn = jax.value_and_grad(_actor_loss_fn)
+
+                    # compute value function gradient
+                    _, g_v = value_grad_fn(
+                        train_state.params,
+                        traj_batch,
+                        advantages_e,
+                        targets_e,
+                        advantages_i,
+                        targets_i,
+                    )
+
+                    if config["USE_RND"] and config["USE_OCG"]:
+                         # compute extrinsic policy gradient
+                        _, g_e = actor_grad_fn( train_state.params, traj_batch, advantages_e)
+
+                        # get intrinsic policy gradient
+                        _, g_i = actor_grad_fn(train_state.params, traj_batch, advantages_i)
+
+                        # dot = g_i \cdot g_e
+                        dot = jax.tree_util.tree_reduce(
+                            lambda x, y: x + y,
+                            jax.tree_util.tree_map(lambda gi, ge: jnp.sum(gi * ge), g_i, g_e)
+                        )
+
+                        def orthogonalize(g_i, g_e):
+                            # dot = g_i \cdot g_e
+                            dot = jax.tree_util.tree_reduce(
+                                lambda x, y: x + y,
+                                jax.tree_util.tree_map(lambda gi, ge: jnp.sum(gi * ge), g_i, g_e)
+                            )
+
+                            # norm_sq = ||g_e||^2
+                            norm_sq = jax.tree_util.tree_reduce(
+                                lambda x, y: x + y,
+                                jax.tree_util.tree_map(lambda ge: jnp.sum(jnp.square(ge)), g_e)
+                            )
+
+                            # project g_i onto g_e
+                            projection = jax.tree.map(
+                                lambda ge: ge * (dot / (norm_sq + 1e-8)), g_e
+                            )
+
+                            return jax.tree.map(lambda gi, proj: gi - proj, g_i, projection)
+
+                        # conditionally project gradients
+                        condition = jnp.logical_or(not config["COND_OCG"], dot < 0)
+                        final_g_i = jax.lax.cond(
+                            condition,
+                            orthogonalize,  # if True
+                            lambda g_i, g_e: g_i,  # if False
+                            g_i, g_e 
+                        )
+
+                        # clip final_g_i magnitude
+                        if config["CLIP_OCG"]:
+                            # norm_sq = ||g_e||^2
+                            norm_sq = jax.tree_util.tree_reduce(
+                                lambda x, y: x + y,
+                                jax.tree_util.tree_map(lambda ge: jnp.sum(jnp.square(ge)), g_e)
+                            )
+
+                            norm_e = jnp.sqrt(norm_sq + 1e-8)
+                            norm_sq_i_ortho = jax.tree_util.tree_reduce(
+                                lambda x, y: x + y,
+                                jax.tree_util.tree_map(lambda g: jnp.sum(jnp.square(g)), final_g_i)
+                            )
+                            norm_i_ortho = jnp.sqrt(norm_sq_i_ortho + 1e-8)
+                            clipping_scale = jnp.minimum(1.0, norm_e / norm_i_ortho)
+                            final_g_i = jax.tree.map(
+                                lambda g: g * clipping_scale, final_g_i
+                            )
+
+                        # compute total gradient, g = g_v + g_e + final_g_i
+                        total_grads = jax.tree.map(
+                            lambda gv, ge, gi: config["VF_COEF"] * gv + ge + gi,
+                            g_v, g_e, final_g_i
+                        )
+                    else:
+                        # default rnd, just combine advantages as usual
+                        gae = advantages_e
+                        if config["USE_RND"]:
+                            gae += advantages_i * config["RND_GAE_COEFF"]
+
+                        _, g_actor = actor_grad_fn(train_state.params, traj_batch, gae)
+                        total_grads = jax.tree.map(
+                            lambda gv, ga: config["VF_COEF"] * gv + ga, g_v, g_actor
+                        )
+
+                    train_state = train_state.apply_gradients(grads=total_grads)
+                    losses = (0, 0) # dummy for now
+                    return train_state, losses
+
+
                 (
                     train_state,
                     traj_batch,
@@ -401,7 +579,7 @@ def make_train(config):
                     shuffled_batch,
                 )
                 train_state, losses = jax.lax.scan(
-                    _update_minbatch, train_state, minibatches
+                    _update_minibatch, train_state, minibatches
                 )
                 update_state = (
                     train_state,
@@ -555,14 +733,26 @@ def run_ppo(config):
     config = {k.upper(): v for k, v in config.__dict__.items()}
 
     if config["USE_WANDB"]:
+        alg = "PPO"
+        if config["USE_RND"]:
+            alg += "-RND"
+        if config["USE_OCG"]:
+            alg += "-OCG"
+        if config["CLIP_OCG"]:
+            alg += "-CLIP"
+        if config["COND_OCG"]:
+            alg += "-COND"
+        config["ALG"] = alg
+
         wandb.init(
             project=config["WANDB_PROJECT"],
             entity=config["WANDB_ENTITY"],
             config=config,
             name=config["ENV_NAME"]
-            + "-PPO_RND-"
+            + f"-{alg}-"
             + str(int(config["TOTAL_TIMESTEPS"] // 1e6))
             + "M",
+            tags=[config["WANDB_TAG"], alg],
         )
 
     rng = jax.random.PRNGKey(config["SEED"])
@@ -623,7 +813,7 @@ if __name__ == "__main__":
         default=1024,
     )
     parser.add_argument(
-        "--total_timesteps", type=lambda x: int(float(x)), default=1e9
+        "--total_timesteps", type=lambda x: int(float(x)), default=1e8
     )  # Allow scientific notation
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--num_steps", type=int, default=64)
@@ -648,8 +838,9 @@ if __name__ == "__main__":
     parser.add_argument("--save_policy", action="store_true")
     parser.add_argument("--num_repeats", type=int, default=1)
     parser.add_argument("--layer_size", type=int, default=512)
-    parser.add_argument("--wandb_project", type=str)
-    parser.add_argument("--wandb_entity", type=str)
+    parser.add_argument("--wandb_project", type=str, default="OCG-RL")
+    parser.add_argument("--wandb_entity", type=str, default="star-lab-gt")
+    parser.add_argument("--wandb_tag", type=str, default="EXP-LR")
     parser.add_argument(
         "--use_optimistic_resets", action=argparse.BooleanOptionalAction, default=True
     )
@@ -657,6 +848,7 @@ if __name__ == "__main__":
 
     # EXPLORATION
     parser.add_argument("--exploration_update_epochs", type=int, default=1)
+
     # RND
     parser.add_argument(
         "--use_rnd", action=argparse.BooleanOptionalAction, default=True
@@ -670,6 +862,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--rnd_is_episodic", action=argparse.BooleanOptionalAction, default=False
     )
+
+    # ORTHOGONALIZATION
+    parser.add_argument("--use_ocg", action="store_true")
+    parser.add_argument("--clip_ocg", action="store_true")
+    parser.add_argument("--cond_ocg", action="store_true")
 
     args, rest_args = parser.parse_known_args(sys.argv[1:])
     if rest_args:
