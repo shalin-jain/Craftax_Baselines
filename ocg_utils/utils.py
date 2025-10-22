@@ -2,16 +2,16 @@ import jax
 import jax.numpy as jnp
 
 def sq_norm(g):
-    return jax.tree_util.tree_reduce(
+    return jax.tree.reduce(
         lambda x, y: x + y,
-        jax.tree_util.tree_map(lambda _g: jnp.sum(jnp.square(_g)), g)
+        jax.tree.map(lambda _g: jnp.sum(jnp.square(_g)), g)
     )
 
 def dot(g_1, g_2):
     """Compute dot product of g_1 and g_2"""
-    return jax.tree_util.tree_reduce(
+    return jax.tree.reduce(
         lambda x, y: x + y,
-        jax.tree_util.tree_map(lambda g1, g2: jnp.sum(g1 * g2), g_1, g_2)
+        jax.tree.map(lambda g1, g2: jnp.sum(g1 * g2), g_1, g_2)
     )
 
 def clip_rel(g_1, g_2):
@@ -41,13 +41,13 @@ def project_out(g_1, g_2):
 def ocg(g_i, g_e, config):
     """Orthogonalize the intrinsic gradient to the extrinsic one and combines them."""
     # dot = g_i \cdot g_e
-    dot = jax.tree_util.tree_reduce(
+    dot = jax.tree.reduce(
         lambda x, y: x + y,
-        jax.tree_util.tree_map(lambda gi, ge: jnp.sum(gi * ge), g_i, g_e)
+        jax.tree.map(lambda gi, ge: jnp.sum(gi * ge), g_i, g_e)
     )
 
     # project out the component of g_i that aligns with g_e
-    # only when the dot product is positive (gradients are conflicting).
+    # only when the dot product is negative (gradients are conflicting).
     # if COND_OCG is False, we always project.
     condition_to_project = jnp.logical_or(not config["COND_OCG"], dot < 0)
 

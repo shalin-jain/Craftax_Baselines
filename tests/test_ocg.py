@@ -227,7 +227,7 @@ def test_ocg_logic(mock_grads):
     )
 
     # g_i should not be the same
-    equal = jax.tree_util.tree_reduce(
+    equal = jax.tree.reduce(
         lambda x, y: x & y,
         jax.tree.map(
             lambda p, e: np.allclose(p, e, atol=1e-6),
