@@ -29,6 +29,9 @@ from wrappers import (
 )
 from models.rnd import RNDNetwork, ActorCriticRND
 
+# Stat util import
+from stat_utils.utils import RunningMeanStd
+
 # OCG imports
 from ocg_utils.utils import ocg
 
@@ -116,6 +119,7 @@ def make_train(config):
         # Exploration state
         ex_state = {
             "rnd_model": None,
+            "rnd_stats": RunningMeanStd.create(),
         }
 
         if config["USE_RND"]:
@@ -196,7 +200,9 @@ def make_train(config):
                     error = (random_pred - distill_pred) * (1 - done[:, None])
                     mse = jnp.square(error).mean(axis=-1)
 
-                    reward_i = mse * config["RND_REWARD_COEFF"]
+                    # Normalize intrinsic reward
+                    ex_state["rnd_stats"] = ex_state["rnd_stats"].update(mse)
+                    reward_i = ex_state["rnd_stats"].normalize(mse) * config["RND_REWARD_COEFF"]
 
                 reward = reward_e + reward_i
 
@@ -378,7 +384,7 @@ def make_train(config):
                         _, g_e = actor_grad_fn( train_state.params, traj_batch, advantages_e)
 
                         # get intrinsic policy gradient
-                        _, g_i = actor_grad_fn(train_state.params, traj_batch, advantages_i)
+                        _, g_i = actor_grad_fn(train_state.params, traj_batch, advantages_i * config["RND_GAE_COEFF"])
 
                         # run orthogonal curiosity gradient procedure (OCG)
                         g_i, g_e = ocg(g_i, g_e, config)
@@ -698,7 +704,7 @@ if __name__ == "__main__":
     parser.add_argument("--layer_size", type=int, default=512)
     parser.add_argument("--wandb_project", type=str, default="OCG-RL")
     parser.add_argument("--wandb_entity", type=str, default="star-lab-gt")
-    parser.add_argument("--wandb_tag", type=str, default="EXP-LR")
+    parser.add_argument("--wandb_tag", type=str, default="EXP-REW-NORM")
     parser.add_argument(
         "--use_optimistic_resets", action=argparse.BooleanOptionalAction, default=True
     )
